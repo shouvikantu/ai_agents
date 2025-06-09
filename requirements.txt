@@ -10,7 +10,7 @@ tabulate
 
 # Data wrangling
 pandas>=2.2.2
-
+reportlab
 # Web UI
 streamlit>=1.33.0
 
