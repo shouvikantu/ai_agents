@@ -1,228 +1,251 @@
+"""
+Financial-performance agent with Streamlit UI
+Compatible with:
+  • Python ≥ 3.9 (tested on 3.12)
+  • langchain-openai ≥ 0.1.0
+  • langgraph ≥ 0.0.41
+  • streamlit ≥ 1.33
+  • tavily-python ≥ 0.3.2
+"""
+
+# ─── Standard library ───────────────────────────────────────────────────────────
+from __future__ import annotations
+
 import os
-from typing import Annotated, List, TypedDict
+import re
+import json
+from io import StringIO
+from typing import List, TypedDict
+
+# ─── Third-party ────────────────────────────────────────────────────────────────
+import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
-import re
-import operator
-import json
 from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.sqlite import SqliteSaver
-import pandas as pd
-from io import StringIO
-from tavily import TavilyClient
-from typing import TypedDict
-from langchain_core.pydantic_v1 import BaseModel
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.pydantic_v1 import BaseModel
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+from tavily import TavilyClient
+import streamlit as st
 
-memory = SqliteSaver.from_conn_string(":memory:")
 
+# ─── Environment & keys ─────────────────────────────────────────────────────────
 load_dotenv()
 
-open_key = os.getenv("OPENAI_API_KEY")
-openai_key = open_key.strip().strip('"').strip("'").replace("“", "").replace("”", "")
+def _clean(value: str | None) -> str:
+    return (value or "").strip().strip('"\''"“”")
 
-tavily_key = os.getenv("TAVILY_API_KEY")
+OPENAI_API_KEY = _clean(os.getenv("OPENAI_API_KEY"))
+TAVILY_API_KEY = _clean(os.getenv("TAVILY_API_KEY"))
 
-llm_name="gpt-3.5-turbo"
+# ─── External clients ───────────────────────────────────────────────────────────
+model = ChatOpenAI(
+    model_name="gpt-4o-mini",        # >>> changed: newer model; adjust if desired
+    openai_api_key=OPENAI_API_KEY,
+    temperature=0.2,
+)
+tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
-model = ChatOpenAI(api_key=openai_key, model=llm_name)
-tavily = TavilyClient(api_key=tavily_key)
-
-class AgentState(TypedDict):
-    task : str
-    competitors : List[str]
-    csv_file : str
-    financial_data :str
+# ─── LangGraph state schema ─────────────────────────────────────────────────────
+class AgentState(TypedDict, total=False):
+    task: str
+    competitors: List[str]
+    csv_file: str
+    financial_data: str
     analysis: str
-    competitor_data : str
-    comparison : str
-    feedback : str
-    content: List[str]
-    report : str
+    competitor_data: str          # consolidated competitor docs
+    comparison: str
+    feedback: str
+    content: List[str]            # scratch pad for retrieved docs
+    report: str
     revision_number: int
-    max_revision: str
-    
+    max_revisions: int
+
+# ─── Helper model for structured LLM output ─────────────────────────────────────
 class Queries(BaseModel):
     queries: List[str]
-    
-# Define the prompts for each node - IMPROVE AS NEEDED
-GATHER_FINANCIALS_PROMPT = """You are an expert financial analyst. Gather the financial data for the given company. Provide detailed financial data."""
-ANALYZE_DATA_PROMPT = """You are an expert financial analyst. Analyze the provided financial data and provide detailed insights and analysis."""
-RESEARCH_COMPETITORS_PROMPT = """You are a researcher tasked with providing information about similar companies for performance comparison. Generate a list of search queries to gather relevant information. Only generate 3 queries max."""
-COMPETE_PERFORMANCE_PROMPT = """You are an expert financial analyst. Compare the financial performance of the given company with its competitors based on the provided data.
-**MAKE SURE TO INCLUDE THE NAMES OF THE COMPETITORS IN THE COMPARISON.**"""
-FEEDBACK_PROMPT = """You are a reviewer. Provide detailed feedback and critique for the provided financial comparison report. Include any additional information or revisions needed."""
-WRITE_REPORT_PROMPT = """You are a financial report writer. Write a comprehensive financial report based on the analysis, competitor research, comparison, and feedback provided."""
-RESEARCH_CRITIQUE_PROMPT = """You are a researcher tasked with providing information to address the provided critique. Generate a list of search queries to gather relevant information. Only generate 3 queries max."""
 
+# ─── Prompts ────────────────────────────────────────────────────────────────────
+GATHER_FINANCIALS_PROMPT = (
+    "You are an expert financial analyst. "
+    "Summarise the key metrics, trends, and red-flags in the following CSV data."
+)
 
-def gather_financials_node(state:AgentState):
-    csv_file = state['csv_file']
-    df = pd.read_csv(StringIO(csv_file))
-    
-    financial_data_str = df.to_string(index=False)
-    
-    combine_content = (
-        f"{state['task']}\n\nHere is the financial data:\n\n{financial_data_str}"
-    )
-    
+ANALYZE_DATA_PROMPT = (
+    "You are an expert financial analyst. Provide a deep-dive analysis of the "
+    "company's performance based on the extracted metrics. Be concise but thorough."
+)
+
+RESEARCH_COMPETITORS_PROMPT = (
+    "Generate up to three **concise** web-search queries I can use to gather "
+    "information on similar companies for benchmarking."
+)
+
+COMPARE_PERFORMANCE_PROMPT = (
+    "Compare the target company with each competitor below. "
+    "Highlight relative strengths, weaknesses, and notable ratios."
+)
+
+FEEDBACK_PROMPT = (
+    "You are a picky reviewer. Provide constructive, detailed feedback on the "
+    "draft comparison report."
+)
+
+WRITE_REPORT_PROMPT = (
+    "Write a polished, investor-ready report incorporating the analysis, "
+    "benchmarking, and reviewer feedback."
+)
+
+RESEARCH_CRITIQUE_PROMPT = (
+    "Generate up to three targeted search queries that would help address the "
+    "specific reviewer comments."
+)
+
+# ─── LangGraph nodes ────────────────────────────────────────────────────────────
+def gather_financials_node(state: AgentState) -> AgentState:
+    df = pd.read_csv(StringIO(state["csv_file"]))
     messages = [
-        SystemMessage(content = GATHER_FINANCIALS_PROMPT),
-        HumanMessage(content = combine_content),
+        SystemMessage(content=GATHER_FINANCIALS_PROMPT),
+        HumanMessage(content=df.to_markdown(index=False)),
     ]
-    
     response = model.invoke(messages)
-    return {"financial_data": response.content }
-    
-def analyze_data_node(state:AgentState):
+    return {"financial_data": response.content}
+
+def analyze_data_node(state: AgentState) -> AgentState:
     messages = [
         SystemMessage(content=ANALYZE_DATA_PROMPT),
-        HumanMessage(content=state['financial_data'])
+        HumanMessage(content=state["financial_data"]),
     ]
     response = model.invoke(messages)
-    return {"Analysis": response.content}
+    return {"analysis": response.content}
 
-def research_competitors_node(state:AgentState):
-    content = state.get("content", [])
-    for competitor in state["competitors"]:
-        queries = model.with_structured_output(Queries).invoke(
-            SystemMessage(content=RESEARCH_COMPETITORS_PROMPT),
-            HumanMessage(content=competitor),
+def research_competitors_node(state: AgentState) -> AgentState:
+    docs: list[str] = state.get("content", [])
+    for name in state["competitors"]:
+        chain = model.with_structured_output(Queries)
+        qry_obj: Queries = chain.invoke(
+            [SystemMessage(content=RESEARCH_COMPETITORS_PROMPT),
+             HumanMessage(content=name)]
         )
-        for q in queries.queries:
-            response = tavily.search(query=q, max_results=2)
-            for r in response["results"]:
-                content.append(r["content"])
-    return {"content": content}
+        for q in qry_obj.queries:
+            search_resp = tavily.search(q, max_results=3)
+            docs.extend(r["content"] for r in search_resp["results"])
+    return {"content": docs}
 
-def compare_performance_node(state: AgentState):
-    content = "\n\n".join(state["content"] or [])
-    user_message = HumanMessage(
-        content=f"{state['task']}\n\nHere is the financial analysis:\n\n{state['analysis']}"
-    )
+def compare_performance_node(state: AgentState) -> AgentState:
+    body = "\n\n".join(state.get("content", []))
     messages = [
-        SystemMessage(content=COMPETE_PERFORMANCE_PROMPT.format(content=content)),
-        user_message,
+        SystemMessage(content=f"{COMPARE_PERFORMANCE_PROMPT}\n\n{body}"),
+        HumanMessage(content=state["analysis"]),
     ]
-    response = model.invoke(messages)
-    return {
-        "comparison": response.content,
-        "revision_number": state.get("revision_number", 1) + 1,
-    }
-    
-def research_critique_node(state: AgentState):
-    queries = model.with_structured_output(Queries).invoke(
-        [
-            SystemMessage(content=RESEARCH_CRITIQUE_PROMPT),
-            HumanMessage(content=state["feedback"]),
-        ]
-    )
-    content = state["content"] or []
-    for q in queries.queries:
-        response = tavily.search(query=q, max_results=2)
-        for r in response["results"]:
-            content.append(r["content"])
-    return {"content": content}
+    draft = model.invoke(messages).content
+    next_rev = state.get("revision_number", 1) + 1
+    return {"comparison": draft, "revision_number": next_rev}
 
-
-def collect_feedback_node(state: AgentState):
+def collect_feedback_node(state: AgentState) -> AgentState:
     messages = [
         SystemMessage(content=FEEDBACK_PROMPT),
         HumanMessage(content=state["comparison"]),
     ]
-    response = model.invoke(messages)
-    return {"feedback": response.content}
+    fb = model.invoke(messages).content
+    return {"feedback": fb}
 
-def write_report_node(state: AgentState):
+def research_critique_node(state: AgentState) -> AgentState:
+    chain = model.with_structured_output(Queries)
+    qry_obj: Queries = chain.invoke(
+        [SystemMessage(content=RESEARCH_CRITIQUE_PROMPT),
+         HumanMessage(content=state["feedback"])]
+    )
+    docs = state.get("content", [])
+    for q in qry_obj.queries:
+        search_resp = tavily.search(q, max_results=3)
+        docs.extend(r["content"] for r in search_resp["results"])
+    return {"content": docs}
+
+def write_report_node(state: AgentState) -> AgentState:
     messages = [
         SystemMessage(content=WRITE_REPORT_PROMPT),
         HumanMessage(content=state["comparison"]),
     ]
-    response = model.invoke(messages)
-    return {"report": response.content}
+    final = model.invoke(messages).content
+    return {"report": final}
 
-
-def should_continue(state):
+# ─── Flow control ───────────────────────────────────────────────────────────────
+def route_after_compare(state: AgentState) -> str:
+    """Decide whether to loop again or finish."""
     if state["revision_number"] > state["max_revisions"]:
-        return END
+        return "write_report"
     return "collect_feedback"
 
+memory = SqliteSaver.from_conn_string(":memory:")
 builder = StateGraph(AgentState)
 
-builder.add_node("gather_financials", gather_financials_node)
-builder.add_node("analyze_data", analyze_data_node)
-builder.add_node("research_competitors", research_competitors_node)
-builder.add_node("compare_performance", compare_performance_node)
-builder.add_node("collect_feedback", collect_feedback_node)
-builder.add_node("research_critique", research_critique_node)
-
-builder.add_node("write_report", write_report_node)
-
+builder.add_node("gather_financials",     gather_financials_node)
+builder.add_node("analyze_data",          analyze_data_node)
+builder.add_node("research_competitors",  research_competitors_node)
+builder.add_node("compare_performance",   compare_performance_node)
+builder.add_node("collect_feedback",      collect_feedback_node)
+builder.add_node("research_critique",     research_critique_node)
+builder.add_node("write_report",          write_report_node)
 
 builder.set_entry_point("gather_financials")
 
+builder.add_edge("gather_financials",    "analyze_data")
+builder.add_edge("analyze_data",         "research_competitors")
+builder.add_edge("research_competitors", "compare_performance")
+builder.add_edge("collect_feedback",     "research_critique")
+builder.add_edge("research_critique",    "compare_performance")
 
+# >>> changed: conditional routing
 builder.add_conditional_edges(
     "compare_performance",
-    should_continue,
-    {END: END, "collect_feedback": "collect_feedback"},
+    route_after_compare,
+    {
+        "collect_feedback": "collect_feedback",
+        "write_report": "write_report",
+    },
 )
-
-builder.add_edge("gather_financials", "analyze_data")
-builder.add_edge("analyze_data", "research_competitors")
-builder.add_edge("research_competitors", "compare_performance")
-builder.add_edge("collect_feedback", "research_critique")
-builder.add_edge("research_critique", "compare_performance")
-builder.add_edge("compare_performance", "write_report")
 
 graph = builder.compile(checkpointer=memory)
 
+# ─── Streamlit UI ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Financial-Performance Agent", layout="wide")
 
-# STREAMLIT FOR UI
+def main() -> None:
+    st.title("📊 Financial Performance Reporting Agent")
 
-import streamlit as st
+    task       = st.text_input("Task",
+        "Analyse our company's financial performance versus competitors")
+    competitors = st.text_area(
+        "Competitor names (one per line)").splitlines()
+    max_revs   = st.number_input("Maximum revision cycles", 1, 10, value=2)
+    csv_file   = st.file_uploader(
+        "Upload the company's CSV financial data", type="csv")
 
-def main():
-    st.title("Financial Performance Reporting Agent")
+    if st.button("Run analysis") and csv_file:
+        csv_data = csv_file.getvalue().decode("utf-8")
 
-    task = st.text_input(
-        "Enter the task:",
-        "Analyze the financial performance of our company (MyAICo.AI) compared to competitors",
-    )
-    competitors = st.text_area("Enter competitor names (one per line):").split("\n")
-    max_revisions = st.number_input("Max Revisions", min_value=1, value=2)
-    uploaded_file = st.file_uploader(
-        "Upload a CSV file with the company's financial data", type=["csv"]
-    )
-
-    if st.button("Start Analysis") and uploaded_file is not None:
-        # Read the uploaded CSV file
-        csv_data = uploaded_file.getvalue().decode("utf-8")
-
-        initial_state = {
+        init_state: AgentState = {
             "task": task,
-            "competitors": [comp.strip() for comp in competitors if comp.strip()],
+            "competitors": [c.strip() for c in competitors if c.strip()],
             "csv_file": csv_data,
-            "max_revisions": max_revisions,
+            "content": [],
             "revision_number": 1,
+            "max_revisions": int(max_revs),
         }
-        thread = {"configurable": {"thread_id": "1"}}
 
-        with SqliteSaver.from_conn_string(":memory:") as checkpointer:
-            graph = builder.compile(checkpointer=checkpointer)
+        with SqliteSaver.from_conn_string(":memory:") as cp:
+            exec_graph = builder.compile(checkpointer=cp)
+            final: AgentState | None = None
 
-            final_state = None
-            for s in graph.stream(initial_state, thread):
-                st.write(s)
-                final_state = s
+            for state in exec_graph.stream(init_state, {"configurable": {"thread_id": "ui"}}):
+                st.write(state)
+                final = state
 
-            if final_state and "report" in final_state:
-                st.subheader("Final Report")
-                st.write(final_state["report"])
-
+        if final and final.get("report"):
+            st.subheader("💼 Final Report")
+            st.write(final["report"])
 
 if __name__ == "__main__":
     main()
